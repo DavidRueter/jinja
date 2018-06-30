@@ -552,7 +552,6 @@ class Filter(Expr):
     fields = ('node', 'name', 'args', 'kwargs', 'dyn_args', 'dyn_kwargs')
 
     def as_const(self, eval_ctx=None):
-        # dbr:  see https://github.com/pallets/jinja/issues/548
         eval_ctx = get_eval_context(self, eval_ctx)
         if eval_ctx.volatile or self.node is None:
             raise Impossible()
@@ -566,14 +565,10 @@ class Filter(Expr):
             raise Impossible()
         obj = self.node.as_const(eval_ctx)
         args = [x.as_const(eval_ctx) for x in self.args]
-        main_args = []  # dbr
-        main_args.insert(0, obj)  # dbr
         if getattr(filter_, 'evalcontextfilter', False):
-            # dbr args.insert(0, eval_ctx)
-            main_args.insert(0, eval_ctx) #dbr
+            args.insert(0, eval_ctx)
         elif getattr(filter_, 'environmentfilter', False):
-            # dbr args.insert(0, self.environment)
-            main_args.insert(0, self.environment) #dbr
+            args.insert(0, self.environment)
         kwargs = dict(x.as_const(eval_ctx) for x in self.kwargs)
         if self.dyn_args is not None:
             try:
@@ -586,8 +581,7 @@ class Filter(Expr):
             except Exception:
                 raise Impossible()
         try:
-            # dbr return filter_(obj, *args, **kwargs)
-            return filter_(main_args, *args, **kwargs)  # dbr
+            return filter_(obj, *args, **kwargs)
         except Exception:
             raise Impossible()
 
