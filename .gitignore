@@ -10,3 +10,9 @@ dist/
 .tox/
 .cache/
 .idea/
+venv/
+venv-*/
+.coverage
+.coverage.*
+htmlcov
+.pytest_cache/

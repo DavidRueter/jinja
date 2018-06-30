@@ -5,13 +5,14 @@
 
     Tests the import features (with includes).
 
-    :copyright: (c) 2010 by the Jinja Team.
+    :copyright: (c) 2017 by the Jinja Team.
     :license: BSD, see LICENSE for more details.
 """
 import pytest
 
 from jinja2 import Environment, DictLoader
-from jinja2.exceptions import TemplateNotFound, TemplatesNotFound
+from jinja2.exceptions import TemplateNotFound, TemplatesNotFound, \
+    TemplateSyntaxError
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def test_env():
 
 
 @pytest.mark.imports
-class TestImports():
+class TestImports(object):
 
     def test_context_imports(self, test_env):
         t = test_env.from_string('{% import "module" as m %}{{ m.test() }}')
@@ -50,12 +51,35 @@ class TestImports():
         )
         assert t.render(foo=42) == '[42|23]'
 
-    def test_trailing_comma(self, test_env):
+    def test_import_needs_name(self, test_env):
+        test_env.from_string('{% from "foo" import bar %}')
+        test_env.from_string('{% from "foo" import bar, baz %}')
+
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import %}')
+
+    def test_no_trailing_comma(self, test_env):
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import bar, %}')
+
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import bar,, %}')
+
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import, %}')
+
+    def test_trailing_comma_with_context(self, test_env):
         test_env.from_string('{% from "foo" import bar, baz with context %}')
         test_env.from_string('{% from "foo" import bar, baz, with context %}')
         test_env.from_string('{% from "foo" import bar, with context %}')
         test_env.from_string('{% from "foo" import bar, with, context %}')
         test_env.from_string('{% from "foo" import bar, with with context %}')
+
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import bar,, with context %}')
+
+        with pytest.raises(TemplateSyntaxError):
+            test_env.from_string('{% from "foo" import bar with context, %}')
 
     def test_exports(self, test_env):
         m = test_env.from_string('''
@@ -74,7 +98,7 @@ class TestImports():
 
 @pytest.mark.imports
 @pytest.mark.includes
-class TestIncludes():
+class TestIncludes(object):
 
     def test_context_include(self, test_env):
         t = test_env.from_string('{% include "header" %}')
@@ -146,3 +170,11 @@ class TestIncludes():
             {{ outer("FOO") }}
         """)
         assert t.render().strip() == '(FOO)'
+
+    def test_import_from_with_context(self):
+        env = Environment(loader=DictLoader({
+            'a': '{% macro x() %}{{ foobar }}{% endmacro %}',
+        }))
+        t = env.from_string('{% set foobar = 42 %}{% from "a" '
+                            'import x with context %}{{ x() }}')
+        assert t.render() == '42'

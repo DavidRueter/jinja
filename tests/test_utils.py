@@ -5,7 +5,7 @@
 
     Tests utilities jinja uses.
 
-    :copyright: (c) 2010 by the Jinja Team.
+    :copyright: (c) 2017 by the Jinja Team.
     :license: BSD, see LICENSE for more details.
 """
 import gc
@@ -14,12 +14,13 @@ import pytest
 
 import pickle
 
-from jinja2.utils import LRUCache, escape, object_type_repr, urlize
+from jinja2.utils import LRUCache, escape, object_type_repr, urlize, \
+     select_autoescape
 
 
 @pytest.mark.utils
 @pytest.mark.lrucache
-class TestLRUCache():
+class TestLRUCache(object):
 
     def test_simple(self):
         d = LRUCache(3)
@@ -46,7 +47,7 @@ class TestLRUCache():
 
 @pytest.mark.utils
 @pytest.mark.helpers
-class TestHelpers():
+class TestHelpers(object):
 
     def test_object_type_repr(self):
         class X(object):
@@ -57,28 +58,26 @@ class TestHelpers():
         assert object_type_repr(None) == 'None'
         assert object_type_repr(Ellipsis) == 'Ellipsis'
 
+    def test_autoescape_select(self):
+        func = select_autoescape(
+            enabled_extensions=('html', '.htm'),
+            disabled_extensions=('txt',),
+            default_for_string='STRING',
+            default='NONE',
+        )
 
-@pytest.mark.utils
-@pytest.mark.markupleak
-@pytest.mark.skipif(hasattr(escape, 'func_code'),
-                    reason='this test only tests the c extension')
-class TestMarkupLeak():
-
-    def test_markup_leaks(self):
-        counts = set()
-        for count in range(20):
-            for item in range(1000):
-                escape("foo")
-                escape("<foo>")
-                escape(u"foo")
-                escape(u"<foo>")
-            counts.add(len(gc.get_objects()))
-        assert len(counts) == 1, 'ouch, c extension seems to leak objects'
+        assert func(None) == 'STRING'
+        assert func('unknown.foo') == 'NONE'
+        assert func('foo.html') == True
+        assert func('foo.htm') == True
+        assert func('foo.txt') == False
+        assert func('FOO.HTML') == True
+        assert func('FOO.TXT') == False
 
 
 @pytest.mark.utils
 @pytest.mark.escapeUrlizeTarget
-class TestEscapeUrlizeTarget():
+class TestEscapeUrlizeTarget(object):
     def test_escape_urlize_target(self):
         url = "http://example.org"
         target = "<script>"

@@ -5,24 +5,25 @@
 
     Bundled jinja filters.
 
-    :copyright: (c) 2010 by the Jinja Team.
+    :copyright: (c) 2017 by the Jinja Team.
     :license: BSD, see LICENSE for more details.
 """
 import re
 import math
+import random
+import warnings
 
-from random import choice
-from itertools import groupby
+from itertools import groupby, chain
 from collections import namedtuple
 from jinja2.utils import Markup, escape, pformat, urlize, soft_unicode, \
-     unicode_urlencode
+     unicode_urlencode, htmlsafe_json_dumps
 from jinja2.runtime import Undefined
 from jinja2.exceptions import FilterArgumentError
-from jinja2._compat import imap, string_types, text_type, iteritems
+from jinja2._compat import imap, string_types, text_type, iteritems, PY2
 
 
-_word_re = re.compile(r'\w+(?u)')
-_word_beginning_split_re = re.compile(r'([-\s\(\{\[\<]+)(?u)')
+_word_re = re.compile(r'\w+', re.UNICODE)
+_word_beginning_split_re = re.compile(r'([-\s\(\{\[\<]+)', re.UNICODE)
 
 
 def contextfilter(f):
@@ -52,22 +53,34 @@ def environmentfilter(f):
     return f
 
 
-def make_attrgetter(environment, attribute):
+def ignore_case(value):
+    """For use as a postprocessor for :func:`make_attrgetter`. Converts strings
+    to lowercase and returns other types as-is."""
+    return value.lower() if isinstance(value, string_types) else value
+
+
+def make_attrgetter(environment, attribute, postprocess=None):
     """Returns a callable that looks up the given attribute from a
     passed object with the rules of the environment.  Dots are allowed
     to access attributes of attributes.  Integer parts in paths are
     looked up as integers.
     """
-    if not isinstance(attribute, string_types) \
-       or ('.' not in attribute and not attribute.isdigit()):
-        return lambda x: environment.getitem(x, attribute)
-    attribute = attribute.split('.')
+    if attribute is None:
+        attribute = []
+    elif isinstance(attribute, string_types):
+        attribute = [int(x) if x.isdigit() else x for x in attribute.split('.')]
+    else:
+        attribute = [attribute]
+
     def attrgetter(item):
         for part in attribute:
-            if part.isdigit():
-                part = int(part)
             item = environment.getitem(item, part)
+
+        if postprocess is not None:
+            item = postprocess(item)
+
         return item
+
     return attrgetter
 
 
@@ -190,7 +203,7 @@ def do_title(s):
          if item])
 
 
-def do_dictsort(value, case_sensitive=False, by='key'):
+def do_dictsort(value, case_sensitive=False, by='key', reverse=False):
     """Sort a dict and yield (key, value) pairs. Because python dicts are
     unsorted you may want to use this function to order them by either
     key or value:
@@ -199,6 +212,9 @@ def do_dictsort(value, case_sensitive=False, by='key'):
 
         {% for item in mydict|dictsort %}
             sort the dict by key, case insensitive
+
+        {% for item in mydict|dictsort(reverse=true) %}
+            sort the dict by key, case insensitive, reverse order
 
         {% for item in mydict|dictsort(true) %}
             sort the dict by key, case sensitive
@@ -211,20 +227,25 @@ def do_dictsort(value, case_sensitive=False, by='key'):
     elif by == 'value':
         pos = 1
     else:
-        raise FilterArgumentError('You can only sort by either '
-                                  '"key" or "value"')
+        raise FilterArgumentError(
+            'You can only sort by either "key" or "value"'
+        )
+
     def sort_func(item):
         value = item[pos]
-        if isinstance(value, string_types) and not case_sensitive:
-            value = value.lower()
+
+        if not case_sensitive:
+            value = ignore_case(value)
+
         return value
 
-    return sorted(value.items(), key=sort_func)
+    return sorted(value.items(), key=sort_func, reverse=reverse)
 
 
 @environmentfilter
-def do_sort(environment, value, reverse=False, case_sensitive=False,
-            attribute=None):
+def do_sort(
+    environment, value, reverse=False, case_sensitive=False, attribute=None
+):
     """Sort an iterable.  Per default it sorts ascending, if you pass it
     true as first argument it will reverse the sorting.
 
@@ -250,18 +271,85 @@ def do_sort(environment, value, reverse=False, case_sensitive=False,
     .. versionchanged:: 2.6
        The `attribute` parameter was added.
     """
-    if not case_sensitive:
-        def sort_func(item):
-            if isinstance(item, string_types):
-                item = item.lower()
-            return item
-    else:
-        sort_func = None
-    if attribute is not None:
-        getter = make_attrgetter(environment, attribute)
-        def sort_func(item, processor=sort_func or (lambda x: x)):
-            return processor(getter(item))
-    return sorted(value, key=sort_func, reverse=reverse)
+    key_func = make_attrgetter(
+        environment, attribute,
+        postprocess=ignore_case if not case_sensitive else None
+    )
+    return sorted(value, key=key_func, reverse=reverse)
+
+
+@environmentfilter
+def do_unique(environment, value, case_sensitive=False, attribute=None):
+    """Returns a list of unique items from the the given iterable.
+
+    .. sourcecode:: jinja
+
+        {{ ['foo', 'bar', 'foobar', 'FooBar']|unique }}
+            -> ['foo', 'bar', 'foobar']
+
+    The unique items are yielded in the same order as their first occurrence in
+    the iterable passed to the filter.
+
+    :param case_sensitive: Treat upper and lower case strings as distinct.
+    :param attribute: Filter objects with unique values for this attribute.
+    """
+    getter = make_attrgetter(
+        environment, attribute,
+        postprocess=ignore_case if not case_sensitive else None
+    )
+    seen = set()
+
+    for item in value:
+        key = getter(item)
+
+        if key not in seen:
+            seen.add(key)
+            yield item
+
+
+def _min_or_max(environment, value, func, case_sensitive, attribute):
+    it = iter(value)
+
+    try:
+        first = next(it)
+    except StopIteration:
+        return environment.undefined('No aggregated item, sequence was empty.')
+
+    key_func = make_attrgetter(
+        environment, attribute,
+        ignore_case if not case_sensitive else None
+    )
+    return func(chain([first], it), key=key_func)
+
+
+@environmentfilter
+def do_min(environment, value, case_sensitive=False, attribute=None):
+    """Return the smallest item from the sequence.
+
+    .. sourcecode:: jinja
+
+        {{ [1, 2, 3]|min }}
+            -> 1
+
+    :param case_sensitive: Treat upper and lower case strings as distinct.
+    :param attribute: Get the object with the min value of this attribute.
+    """
+    return _min_or_max(environment, value, min, case_sensitive, attribute)
+
+
+@environmentfilter
+def do_max(environment, value, case_sensitive=False, attribute=None):
+    """Return the largest item from the sequence.
+
+    .. sourcecode:: jinja
+
+        {{ [1, 2, 3]|max }}
+            -> 3
+
+    :param case_sensitive: Treat upper and lower case strings as distinct.
+    :param attribute: Get the object with the max value of this attribute.
+    """
+    return _min_or_max(environment, value, max, case_sensitive, attribute)
 
 
 def do_default(value, default_value=u'', boolean=False):
@@ -312,7 +400,7 @@ def do_join(eval_ctx, value, d=u'', attribute=None):
     if attribute is not None:
         value = imap(make_attrgetter(eval_ctx.environment, attribute), value)
 
-    # no automatic escaping?  joining is a lot eaiser then
+    # no automatic escaping?  joining is a lot easier then
     if not eval_ctx.autoescape:
         return text_type(d).join(imap(text_type, value))
 
@@ -359,13 +447,13 @@ def do_last(environment, seq):
         return environment.undefined('No last item, sequence was empty.')
 
 
-@environmentfilter
-def do_random(environment, seq):
+@contextfilter
+def do_random(context, seq):
     """Return a random item from the sequence."""
     try:
-        return choice(seq)
+        return random.choice(seq)
     except IndexError:
-        return environment.undefined('No random item, sequence was empty.')
+        return context.environment.undefined('No random item, sequence was empty.')
 
 
 def do_filesizeformat(value, binary=False):
@@ -409,7 +497,7 @@ def do_pprint(value, verbose=False):
 
 @evalcontextfilter
 def do_urlize(eval_ctx, value, trim_url_limit=None, nofollow=False,
-              target=None):
+              target=None, rel=None):
     """Converts URLs in plain text into clickable links.
 
     If you pass the filter an additional integer it will shorten the urls
@@ -431,55 +519,101 @@ def do_urlize(eval_ctx, value, trim_url_limit=None, nofollow=False,
     .. versionchanged:: 2.8+
        The *target* parameter was added.
     """
-    rv = urlize(value, trim_url_limit, nofollow, target)
+    policies = eval_ctx.environment.policies
+    rel = set((rel or '').split() or [])
+    if nofollow:
+        rel.add('nofollow')
+    rel.update((policies['urlize.rel'] or '').split())
+    if target is None:
+        target = policies['urlize.target']
+    rel = ' '.join(sorted(rel)) or None
+    rv = urlize(value, trim_url_limit, rel=rel, target=target)
     if eval_ctx.autoescape:
         rv = Markup(rv)
     return rv
 
 
-def do_indent(s, width=4, indentfirst=False):
-    """Return a copy of the passed string, each line indented by
-    4 spaces. The first line is not indented. If you want to
-    change the number of spaces or indent the first line too
-    you can pass additional parameters to the filter:
+def do_indent(
+    s, width=4, first=False, blank=False, indentfirst=None
+):
+    """Return a copy of the string with each line indented by 4 spaces. The
+    first line and blank lines are not indented by default.
 
-    .. sourcecode:: jinja
+    :param width: Number of spaces to indent by.
+    :param first: Don't skip indenting the first line.
+    :param blank: Don't skip indenting empty lines.
 
-        {{ mytext|indent(2, true) }}
-            indent by two spaces and indent the first line too.
+    .. versionchanged:: 2.10
+        Blank lines are not indented by default.
+
+        Rename the ``indentfirst`` argument to ``first``.
     """
+    if indentfirst is not None:
+        warnings.warn(DeprecationWarning(
+            'The "indentfirst" argument is renamed to "first".'
+        ), stacklevel=2)
+        first = indentfirst
+
     indention = u' ' * width
-    rv = (u'\n' + indention).join(s.splitlines())
-    if indentfirst:
+    newline = u'\n'
+
+    if isinstance(s, Markup):
+        indention = Markup(indention)
+        newline = Markup(newline)
+
+    s += newline  # this quirk is necessary for splitlines method
+
+    if blank:
+        rv = (newline + indention).join(s.splitlines())
+    else:
+        lines = s.splitlines()
+        rv = lines.pop(0)
+
+        if lines:
+            rv += newline + newline.join(
+                indention + line if line else line for line in lines
+            )
+
+    if first:
         rv = indention + rv
+
     return rv
 
 
-def do_truncate(s, length=255, killwords=False, end='...'):
+@environmentfilter
+def do_truncate(env, s, length=255, killwords=False, end='...', leeway=None):
     """Return a truncated copy of the string. The length is specified
     with the first parameter which defaults to ``255``. If the second
     parameter is ``true`` the filter will cut the text at length. Otherwise
     it will discard the last word. If the text was in fact
     truncated it will append an ellipsis sign (``"..."``). If you want a
     different ellipsis sign than ``"..."`` you can specify it using the
-    third parameter.
+    third parameter. Strings that only exceed the length by the tolerance
+    margin given in the fourth parameter will not be truncated.
 
     .. sourcecode:: jinja
 
-        {{ "foo bar baz"|truncate(9) }}
-            -> "foo ..."
-        {{ "foo bar baz"|truncate(9, True) }}
+        {{ "foo bar baz qux"|truncate(9) }}
+            -> "foo..."
+        {{ "foo bar baz qux"|truncate(9, True) }}
             -> "foo ba..."
+        {{ "foo bar baz qux"|truncate(11) }}
+            -> "foo bar baz qux"
+        {{ "foo bar baz qux"|truncate(11, False, '...', 0) }}
+            -> "foo bar..."
 
+    The default leeway on newer Jinja2 versions is 5 and was 0 before but
+    can be reconfigured globally.
     """
-    if len(s) <= length:
+    if leeway is None:
+        leeway = env.policies['truncate.leeway']
+    assert length >= len(end), 'expected length >= %s, got %s' % (len(end), length)
+    assert leeway >= 0, 'expected leeway >= 0, got %s' % leeway
+    if len(s) <= length + leeway:
         return s
-    elif killwords:
+    if killwords:
         return s[:length - len(end)] + end
-
     result = s[:length - len(end)].rsplit(' ', 1)[0]
-    if len(result) < length:
-        result += ' '
     return result + end
 
 
@@ -671,7 +805,14 @@ def do_round(value, precision=0, method='common'):
     return func(value * (10 ** precision)) / (10 ** precision)
 
 
+# Use a regular tuple repr here.  This is what we did in the past and we
+# really want to hide this custom type as much as possible.  In particular
+# we do not want to accidentally expose an auto generated repr in case
+# people start to print this out in comments or something similar for
+# debugging.
 _GroupTuple = namedtuple('_GroupTuple', ['grouper', 'list'])
+_GroupTuple.__repr__ = tuple.__repr__
+_GroupTuple.__str__ = tuple.__str__
 
 @environmentfilter
 def do_groupby(environment, value, attribute):
@@ -713,7 +854,8 @@ def do_groupby(environment, value, attribute):
        attribute of another attribute.
     """
     expr = make_attrgetter(environment, attribute)
-    return [_GroupTuple(key, list(values)) for key, values in groupby(sorted(value, key=expr), expr)]
+    return [_GroupTuple(key, list(values)) for key, values
+            in groupby(sorted(value, key=expr), expr)]
 
 
 @environmentfilter
@@ -821,24 +963,7 @@ def do_map(*args, **kwargs):
 
     .. versionadded:: 2.7
     """
-    context = args[0]
-    seq = args[1]
-
-    if len(args) == 2 and 'attribute' in kwargs:
-        attribute = kwargs.pop('attribute')
-        if kwargs:
-            raise FilterArgumentError('Unexpected keyword argument %r' %
-                next(iter(kwargs)))
-        func = make_attrgetter(context.environment, attribute)
-    else:
-        try:
-            name = args[2]
-            args = args[3:]
-        except LookupError:
-            raise FilterArgumentError('map requires a filter argument')
-        func = lambda item: context.environment.call_filter(
-            name, item, args, kwargs, context=context)
-
+    seq, func = prepare_map(args, kwargs)
     if seq:
         for item in seq:
             yield func(item)
@@ -857,10 +982,13 @@ def do_select(*args, **kwargs):
 
         {{ numbers|select("odd") }}
         {{ numbers|select("odd") }}
+        {{ numbers|select("divisibleby", 3) }}
+        {{ numbers|select("lessthan", 42) }}
+        {{ strings|select("equalto", "mystring") }}
 
     .. versionadded:: 2.7
     """
-    return _select_or_reject(args, kwargs, lambda x: x, False)
+    return select_or_reject(args, kwargs, lambda x: x, False)
 
 
 @contextfilter
@@ -878,7 +1006,7 @@ def do_reject(*args, **kwargs):
 
     .. versionadded:: 2.7
     """
-    return _select_or_reject(args, kwargs, lambda x: not x, False)
+    return select_or_reject(args, kwargs, lambda x: not x, False)
 
 
 @contextfilter
@@ -899,7 +1027,7 @@ def do_selectattr(*args, **kwargs):
 
     .. versionadded:: 2.7
     """
-    return _select_or_reject(args, kwargs, lambda x: x, True)
+    return select_or_reject(args, kwargs, lambda x: x, True)
 
 
 @contextfilter
@@ -918,10 +1046,67 @@ def do_rejectattr(*args, **kwargs):
 
     .. versionadded:: 2.7
     """
-    return _select_or_reject(args, kwargs, lambda x: not x, True)
+    return select_or_reject(args, kwargs, lambda x: not x, True)
 
 
-def _select_or_reject(args, kwargs, modfunc, lookup_attr):
+@evalcontextfilter
+def do_tojson(eval_ctx, value, indent=None):
+    """Dumps a structure to JSON so that it's safe to use in ``<script>``
+    tags.  It accepts the same arguments and returns a JSON string.  Note that
+    this is available in templates through the ``|tojson`` filter which will
+    also mark the result as safe.  Due to how this function escapes certain
+    characters this is safe even if used outside of ``<script>`` tags.
+
+    The following characters are escaped in strings:
+
+    -   ``<``
+    -   ``>``
+    -   ``&``
+    -   ``'``
+
+    This makes it safe to embed such strings in any place in HTML with the
+    notable exception of double quoted attributes.  In that case single
+    quote your attributes or HTML escape it in addition.
+
+    The indent parameter can be used to enable pretty printing.  Set it to
+    the number of spaces that the structures should be indented with.
+
+    Note that this filter is for use in HTML contexts only.
+
+    .. versionadded:: 2.9
+    """
+    policies = eval_ctx.environment.policies
+    dumper = policies['json.dumps_function']
+    options = policies['json.dumps_kwargs']
+    if indent is not None:
+        options = dict(options)
+        options['indent'] = indent
+    return htmlsafe_json_dumps(value, dumper=dumper, **options)
+
+
+def prepare_map(args, kwargs):
+    context = args[0]
+    seq = args[1]
+
+    if len(args) == 2 and 'attribute' in kwargs:
+        attribute = kwargs.pop('attribute')
+        if kwargs:
+            raise FilterArgumentError('Unexpected keyword argument %r' %
+                next(iter(kwargs)))
+        func = make_attrgetter(context.environment, attribute)
+    else:
+        try:
+            name = args[2]
+            args = args[3:]
+        except LookupError:
+            raise FilterArgumentError('map requires a filter argument')
+        func = lambda item: context.environment.call_filter(
+            name, item, args, kwargs, context=context)
+
+    return seq, func
+
+
+def prepare_select_or_reject(args, kwargs, modfunc, lookup_attr):
     context = args[0]
     seq = args[1]
     if lookup_attr:
@@ -943,9 +1128,14 @@ def _select_or_reject(args, kwargs, modfunc, lookup_attr):
     except LookupError:
         func = bool
 
+    return seq, lambda item: modfunc(func(transfunc(item)))
+
+
+def select_or_reject(args, kwargs, modfunc, lookup_attr):
+    seq, func = prepare_select_or_reject(args, kwargs, modfunc, lookup_attr)
     if seq:
         for item in seq:
-            if modfunc(func(transfunc(item))):
+            if func(item):
                 yield item
 
 
@@ -975,6 +1165,8 @@ FILTERS = {
     'list':                 do_list,
     'lower':                do_lower,
     'map':                  do_map,
+    'min':                  do_min,
+    'max':                  do_max,
     'pprint':               do_pprint,
     'random':               do_random,
     'reject':               do_reject,
@@ -993,10 +1185,12 @@ FILTERS = {
     'title':                do_title,
     'trim':                 do_trim,
     'truncate':             do_truncate,
+    'unique':               do_unique,
     'upper':                do_upper,
     'urlencode':            do_urlencode,
     'urlize':               do_urlize,
     'wordcount':            do_wordcount,
     'wordwrap':             do_wordwrap,
     'xmlattr':              do_xmlattr,
+    'tojson':               do_tojson,
 }

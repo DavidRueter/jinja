@@ -5,16 +5,26 @@
 
     Tests for the jinja filters.
 
-    :copyright: (c) 2010 by the Jinja Team.
+    :copyright: (c) 2017 by the Jinja Team.
     :license: BSD, see LICENSE for more details.
 """
+import random
 import pytest
 from jinja2 import Markup, Environment
 from jinja2._compat import text_type, implements_to_string
 
 
+@implements_to_string
+class Magic(object):
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return text_type(self.value)
+
+
 @pytest.mark.filter
-class TestFilter():
+class TestFilter(object):
 
     def test_filter_calling(self, env):
         rv = env.call_filter('sum', [1, 2, 3])
@@ -35,16 +45,16 @@ class TestFilter():
         )
         assert tmpl.render(given='yes') == 'no|False|no|yes'
 
-    def test_dictsort(self, env):
-        tmpl = env.from_string(
-            '{{ foo|dictsort }}|'
-            '{{ foo|dictsort(true) }}|'
-            '{{ foo|dictsort(false, "value") }}'
-        )
-        out = tmpl.render(foo={"aa": 0, "b": 1, "c": 2, "AB": 3})
-        assert out == ("[('aa', 0), ('AB', 3), ('b', 1), ('c', 2)]|"
-                       "[('AB', 3), ('aa', 0), ('b', 1), ('c', 2)]|"
-                       "[('aa', 0), ('b', 1), ('c', 2), ('AB', 3)]")
+    @pytest.mark.parametrize('args,expect', (
+        ('', "[('aa', 0), ('AB', 3), ('b', 1), ('c', 2)]"),
+        ('true',  "[('AB', 3), ('aa', 0), ('b', 1), ('c', 2)]"),
+        ('by="value"',  "[('aa', 0), ('b', 1), ('c', 2), ('AB', 3)]"),
+        ('reverse=true', "[('c', 2), ('b', 1), ('AB', 3), ('aa', 0)]")
+    ))
+    def test_dictsort(self, env, args, expect):
+        t = env.from_string('{{{{ foo|dictsort({args}) }}}}'.format(args=args))
+        out = t.render(foo={"aa": 0, "b": 1, "c": 2, "AB": 3})
+        assert out == expect
 
     def test_batch(self, env):
         tmpl = env.from_string("{{ foo|batch(3)|list }}|"
@@ -125,12 +135,38 @@ class TestFilter():
         out = tmpl.render()
         assert out == 'a|b'
 
+    @staticmethod
+    def _test_indent_multiline_template(env, markup=False):
+        text = '\n'.join(['', 'foo bar', '"baz"', ''])
+        if markup:
+            text = Markup(text)
+        t = env.from_string('{{ foo|indent(2, false, false) }}')
+        assert t.render(foo=text) == '\n  foo bar\n  "baz"\n'
+        t = env.from_string('{{ foo|indent(2, false, true) }}')
+        assert t.render(foo=text) == '\n  foo bar\n  "baz"\n  '
+        t = env.from_string('{{ foo|indent(2, true, false) }}')
+        assert t.render(foo=text) == '  \n  foo bar\n  "baz"\n'
+        t = env.from_string('{{ foo|indent(2, true, true) }}')
+        assert t.render(foo=text) == '  \n  foo bar\n  "baz"\n  '
+
     def test_indent(self, env):
-        tmpl = env.from_string('{{ foo|indent(2) }}|{{ foo|indent(2, true) }}')
-        text = '\n'.join([' '.join(['foo', 'bar'] * 2)] * 2)
-        out = tmpl.render(foo=text)
-        assert out == ('foo bar foo bar\n  foo bar foo bar|  '
-                       'foo bar foo bar\n  foo bar foo bar')
+        self._test_indent_multiline_template(env)
+        t = env.from_string('{{ "jinja"|indent }}')
+        assert t.render() == 'jinja'
+        t = env.from_string('{{ "jinja"|indent(first=true) }}')
+        assert t.render() == '    jinja'
+        t = env.from_string('{{ "jinja"|indent(blank=true) }}')
+        assert t.render() == 'jinja'
+
+    def test_indent_markup_input(self, env):
+        '''
+        Tests cases where the filter input is a Markup type
+        '''
+        self._test_indent_multiline_template(env, markup=True)
+
+    def test_indentfirst_deprecated(self, env):
+        with pytest.warns(DeprecationWarning):
+            env.from_string('{{ "jinja"|indent(indentfirst=true) }}').render()
 
     def test_int(self, env):
         class IntIsh(object):
@@ -182,11 +218,21 @@ class TestFilter():
         data = list(range(1000))
         assert tmpl.render(data=data) == pformat(data)
 
-    def test_random(self, env):
-        tmpl = env.from_string('''{{ seq|random }}''')
-        seq = list(range(100))
-        for _ in range(10):
-            assert int(tmpl.render(seq=seq)) in seq
+    def test_random(self, env, request):
+        # restore the random state when the test ends
+        state = random.getstate()
+        request.addfinalizer(lambda: random.setstate(state))
+        # generate the random values from a known seed
+        random.seed('jinja')
+        expected = [random.choice('1234567890') for _ in range(10)]
+
+        # check that the random sequence is generated again by a template
+        # ensures that filter result is not constant folded
+        random.seed('jinja')
+        t = env.from_string('{{ "1234567890"|random }}')
+
+        for value in expected:
+            assert t.render() == value
 
     def test_reverse(self, env):
         tmpl = env.from_string('{{ "foobar"|reverse|join }}|'
@@ -239,7 +285,7 @@ class TestFilter():
         out = tmpl.render(data='foobar baz bar' * 1000,
                           smalldata='foobar baz bar')
         msg = 'Current output: %s' % out
-        assert out == 'foobar baz b>>>|foobar baz >>>|foobar baz bar', msg
+        assert out == 'foobar baz b>>>|foobar baz>>>|foobar baz bar', msg
 
     def test_truncate_very_short(self, env):
         tmpl = env.from_string(
@@ -247,12 +293,12 @@ class TestFilter():
             '{{ "foo bar baz"|truncate(9, true) }}'
         )
         out = tmpl.render()
-        assert out == 'foo ...|foo ba...', out
+        assert out == 'foo bar baz|foo bar baz', out
 
     def test_truncate_end_length(self, env):
-        tmpl = env.from_string('{{ "Joel is a slug"|truncate(9, true) }}')
+        tmpl = env.from_string('{{ "Joel is a slug"|truncate(7, true) }}')
         out = tmpl.render()
-        assert out == 'Joel i...', 'Current output: %s' % out
+        assert out == 'Joel...', 'Current output: %s' % out
 
     def test_upper(self, env):
         tmpl = env.from_string('{{ "foo"|upper }}')
@@ -261,21 +307,28 @@ class TestFilter():
     def test_urlize(self, env):
         tmpl = env.from_string(
             '{{ "foo http://www.example.com/ bar"|urlize }}')
-        assert tmpl.render() == 'foo <a href="http://www.example.com/">'\
-                                'http://www.example.com/</a> bar'
+        assert tmpl.render() == (
+            'foo <a href="http://www.example.com/" rel="noopener">'
+            'http://www.example.com/</a> bar'
+        )
+
+    def test_urlize_rel_policy(self):
+        env = Environment()
+        env.policies['urlize.rel'] = None
+        tmpl = env.from_string(
+            '{{ "foo http://www.example.com/ bar"|urlize }}')
+        assert tmpl.render() == (
+            'foo <a href="http://www.example.com/">'
+            'http://www.example.com/</a> bar'
+        )
 
     def test_urlize_target_parameter(self, env):
         tmpl = env.from_string(
             '{{ "foo http://www.example.com/ bar"|urlize(target="_blank") }}'
         )
         assert tmpl.render() \
-            == 'foo <a href="http://www.example.com/" target="_blank">'\
+            == 'foo <a href="http://www.example.com/" rel="noopener" target="_blank">'\
             'http://www.example.com/</a> bar'
-        tmpl = env.from_string(
-            '{{ "foo http://www.example.com/ bar"|urlize(target=42) }}'
-        )
-        assert tmpl.render() == 'foo <a href="http://www.example.com/">'\
-                                'http://www.example.com/</a> bar'
 
     def test_wordcount(self, env):
         tmpl = env.from_string('{{ "foo bar baz"|wordcount }}')
@@ -361,15 +414,40 @@ class TestFilter():
         assert tmpl.render() == "['Bar', 'blah', 'foo']"
 
     def test_sort4(self, env):
-        @implements_to_string
-        class Magic(object):
-            def __init__(self, value):
-                self.value = value
-
-            def __str__(self):
-                return text_type(self.value)
         tmpl = env.from_string('''{{ items|sort(attribute='value')|join }}''')
         assert tmpl.render(items=map(Magic, [3, 2, 4, 1])) == '1234'
+
+    def test_unique(self, env):
+        t = env.from_string('{{ "".join(["b", "A", "a", "b"]|unique) }}')
+        assert t.render() == "bA"
+
+    def test_unique_case_sensitive(self, env):
+        t = env.from_string('{{ "".join(["b", "A", "a", "b"]|unique(true)) }}')
+        assert t.render() == "bAa"
+
+    def test_unique_attribute(self, env):
+        t = env.from_string("{{ items|unique(attribute='value')|join }}")
+        assert t.render(items=map(Magic, [3, 2, 4, 1, 2])) == '3241'
+
+    @pytest.mark.parametrize('source,expect', (
+        ('{{ ["a", "B"]|min }}', 'a'),
+        ('{{ ["a", "B"]|min(case_sensitive=true) }}', 'B'),
+        ('{{ []|min }}', ''),
+        ('{{ ["a", "B"]|max }}', 'B'),
+        ('{{ ["a", "B"]|max(case_sensitive=true) }}', 'a'),
+        ('{{ []|max }}', ''),
+    ))
+    def test_min_max(self, env, source, expect):
+        t = env.from_string(source)
+        assert t.render() == expect
+
+    @pytest.mark.parametrize('name,expect', (
+        ('min', '1'),
+        ('max', '9'),
+    ))
+    def test_min_max_attribute(self, env, name, expect):
+        t = env.from_string('{{ items|' + name + '(attribute="value") }}')
+        assert t.render(items=map(Magic, [5, 1, 9])) == expect
 
     def test_groupby(self, env):
         tmpl = env.from_string('''
@@ -569,3 +647,17 @@ class TestFilter():
         tmpl = env.from_string('{{ users|rejectattr("id", "odd")|'
                                'map(attribute="name")|join("|") }}')
         assert tmpl.render(users=users) == 'jane'
+
+    def test_json_dump(self):
+        env = Environment(autoescape=True)
+        t = env.from_string('{{ x|tojson }}')
+        assert t.render(x={'foo': 'bar'}) == '{"foo": "bar"}'
+        assert t.render(x='"ba&r\'') == r'"\"ba\u0026r\u0027"'
+        assert t.render(x='<bar>') == r'"\u003cbar\u003e"'
+
+        def my_dumps(value, **options):
+            assert options == {'foo': 'bar'}
+            return '42'
+        env.policies['json.dumps_function'] = my_dumps
+        env.policies['json.dumps_kwargs'] = {'foo': 'bar'}
+        assert t.render(x=23) == '42'
